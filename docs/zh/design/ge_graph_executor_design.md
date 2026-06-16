@@ -401,6 +401,32 @@ ge_tensor.SetData(gert::TensorData(dev_ptr, nullptr, bytes, gert::kOnDeviceHbm))
 
 ## 架构设计
 
+### 核心设计理念：适配器模式解耦
+
+**问题**：
+- `ExecutorImpl::run()` 接口是固定的（tokens, positions, kv_caches, params）
+- GeGraphExecutorImpl 必须实现这个接口
+- 直接处理这些参数会导致与具体模型耦合
+
+**解决方案**：适配器模式
+- **GeGraphExecutorImpl**：实现 ExecutorImpl 接口，内部使用适配器
+- **GeGraphInputAdapter**：模型适配器，把模型特定参数转换成通用 Tensor
+- **RunGraph()**：通用 Graph 执行逻辑，接收 `std::vector<gert::Tensor>`
+
+**类比**：
+```cpp
+// 标准接口（ExecutorImpl 要求）
+ModelOutput run(const torch::Tensor& tokens, 
+                const torch::Tensor& positions,
+                std::vector<KVCache>& kv_caches,
+                const ModelInputParams& params);
+
+// 内部实现（解耦）
+auto adapter = GetAdapterForModel(model_type);  // 获取适配器
+auto graph_inputs = adapter->PrepareInputs(tokens, positions, kv_caches, params);
+return RunGraph(graph_inputs);  // 通用 Graph 执行
+```
+
 ### 整体架构图
 
 ```
@@ -409,6 +435,37 @@ ge_tensor.SetData(gert::TensorData(dev_ptr, nullptr, bytes, gert::kOnDeviceHbm))
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │  executor_: std::unique_ptr<Executor>               │   │
 │  │    └── GeGraphExecutorImpl (注册为 "ge" backend)    │   │
+│  └─────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│               GeGraphExecutorImpl                            │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  run(): 实现 ExecutorImpl 接口                       │   │
+│  │    ├─> GetAdapter(model_type)                        │   │
+│  │    ├─> adapter->PrepareInputs(...)                   │   │
+│  │    └─> RunGraph(graph_inputs)                        │   │
+│  └─────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  RunGraph(): 通用 Graph 执行逻辑                     │   │
+│  │    - 接收 std::vector<gert::Tensor>                  │   │
+│  │    - RunModelWithStreamAsync()                       │   │
+│  │    - 管理内存、同步                                   │   │
+│  └─────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│               GeGraphInputAdapter (抽象基类)                 │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  PrepareInputs(tokens, positions, kv_caches, params) │   │
+│  │    └─> 返回 std::vector<gert::Tensor>                │   │
+│  └─────────────────────────────────────────────────────┐   │
+│  │  子类（按模型类型注册）                              │   │
+│  │    ├─> LLMGeGraphAdapter (标准 LLM 模型)             │   │
+│  │    ├─> VLMGeGraphAdapter (视觉语言模型)              │   │
+│  │    └─> RecGeGraphAdapter (推荐模型)                  │   │
 │  └─────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
                             │
@@ -427,7 +484,7 @@ ge_tensor.SetData(gert::TensorData(dev_ptr, nullptr, bytes, gert::kOnDeviceHbm))
 │               GE Runtime (Ascend GE V2)                     │
 │  ┌───────────────────────┐  ┌───────────────────────────┐  │
 │  │  EpairModelLoader     │  │  gert::Tensor             │  │
-│  │  - CompileAndLoad()   │  │  - Device memory          │  │
+│  │  - CompileAndLoad()   │  │  - Device memory          │   │
 │  │  - RunModel...Async() │  │  - Shape/Format/Dtype     │  │
 │  └───────────────────────┘  └───────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
@@ -441,8 +498,38 @@ ExecutorImpl (抽象基类)
     ├── VlmExecutorImpl
     ├── CudaGraphExecutorImpl
     ├── AclGraphExecutorImpl
-    └── GeGraphExecutorImpl  <-- 新增
+    └── GeGraphExecutorImpl  <-- 新增（使用适配器）
+
+GeGraphInputAdapter (抽象基类)  <-- 新增
+    ├── LLMGeGraphAdapter
+    ├── VLMGeGraphAdapter
+    └── RecGeGraphAdapter
 ```
+
+### 模块职责
+
+**GeGraphExecutorImpl**：
+- 实现 `ExecutorImpl::run()` 接口
+- 通过适配器获取 `std::vector<gert::Tensor>`
+- 执行通用 Graph 逻辑（RunGraph）
+- 不关心输入 tensor 的语义（解耦）
+
+**GeGraphInputAdapter**：
+- 模型适配器抽象基类
+- 把模型特定参数转换成 Graph 需要的 Tensor
+- 知道 Graph 输入节点命名规范
+- 按 epair 文件定义的顺序构建 inputs
+
+**GeGraphManager**：
+- 进程级别 GE 初始化
+- 按 device_id 缓存 EpairModelLoader
+- Loader 查询和创建
+
+**RunGraph()**：
+- 通用 Graph 执行逻辑
+- 接收 `std::vector<gert::Tensor>`（输入）
+- 返回 `ModelOutput`（输出）
+- 不关心输入 tensor 的语义
 
 ---
 
@@ -505,11 +592,185 @@ private:
 
 ---
 
-### 2. GeGraphExecutorImpl 类
+### 2. GeGraphInputAdapter 类（新增）
 
 **职责**：
-- 加载 epair 文件并编译（通过 GeGraphManager）
-- 转换 `torch::Tensor` ↔ `gert::Tensor`
+- 模型适配器抽象基类
+- 把模型特定参数（tokens, positions, kv_caches, params）转换成 Graph 需要的 Tensor
+- 知道 Graph 输入节点命名规范
+- 按 epair 文件定义的顺序构建 inputs
+
+**设计模式**：工厂模式 + 注册机制
+
+```cpp
+// ge_graph_input_adapter.h
+namespace xllm {
+namespace core {
+
+class GeGraphInputAdapter {
+public:
+    virtual ~GeGraphInputAdapter() = default;
+    
+    // 把模型特定参数转换成 Graph 需要的 Tensor
+    virtual std::vector<gert::Tensor> PrepareInputs(
+        const torch::Tensor& tokens,
+        const torch::Tensor& positions,
+        std::vector<KVCache>& kv_caches,
+        const ModelInputParams& params) = 0;
+    
+    // 获取适配器名称（用于注册）
+    virtual std::string GetName() const = 0;
+    
+    // 获取 Graph 输出 tensor 数量（用于预分配输出）
+    virtual size_t GetOutputCount() const = 0;
+    
+    // 从 Graph 输出转换成 ModelOutput
+    virtual ModelOutput ConvertOutputs(
+        std::vector<gert::Tensor>& graph_outputs) = 0;
+};
+
+// 适配器工厂（注册机制）
+class GeGraphAdapterFactory {
+public:
+    static GeGraphAdapterFactory& Instance();
+    
+    // 注册适配器
+    void RegisterAdapter(const std::string& name,
+                         std::function<std::unique_ptr<GeGraphInputAdapter>()> creator);
+    
+    // 创建适配器
+    std::unique_ptr<GeGraphInputAdapter> CreateAdapter(const std::string& name);
+    
+private:
+    std::unordered_map<std::string, 
+                       std::function<std::unique_ptr<GeGraphInputAdapter>()>> creators_;
+};
+
+// 注册宏
+#define REGISTER_GE_GRAPH_ADAPTER(name, adapter_class) \
+    namespace { \
+        struct AdapterRegistrar { \
+            AdapterRegistrar() { \
+                GeGraphAdapterFactory::Instance().RegisterAdapter( \
+                    name, []() -> std::unique_ptr<GeGraphInputAdapter> { \
+                        return std::make_unique<adapter_class>(); \
+                    }); \
+            } \
+        } registrar_##adapter_class; \
+    }
+
+}  // namespace core
+}  // namespace xllm
+```
+
+**实现示例（LLMGeGraphAdapter）**：
+
+```cpp
+// llm_ge_graph_adapter.h
+namespace xllm {
+namespace core {
+
+class LLMGeGraphAdapter : public GeGraphInputAdapter {
+public:
+    std::string GetName() const override { return "llm"; }
+    
+    size_t GetOutputCount() const override { return 1; }  // 只有 logits
+    
+    std::vector<gert::Tensor> PrepareInputs(
+        const torch::Tensor& tokens,
+        const torch::Tensor& positions,
+        std::vector<KVCache>& kv_caches,
+        const ModelInputParams& params) override {
+        
+        std::vector<gert::Tensor> graph_inputs;
+        
+        // 1. 添加 input_ids
+        gert::Tensor ge_tokens;
+        TorchToDeviceTensor(tokens, ge_tokens);
+        graph_inputs.push_back(ge_tokens);
+        
+        // 2. 添加 position_ids
+        gert::Tensor ge_positions;
+        TorchToDeviceTensor(positions, ge_positions);
+        graph_inputs.push_back(ge_positions);
+        
+        // 3. 添加 past_key_values（按层）
+        for (size_t layer = 0; layer < kv_caches.size(); ++layer) {
+            torch::Tensor k_cache = kv_caches[layer].get_k_cache();
+            torch::Tensor v_cache = kv_caches[layer].get_v_cache();
+            
+            gert::Tensor ge_k_cache, ge_v_cache;
+            TorchToDeviceTensor(k_cache, ge_k_cache);
+            TorchToDeviceTensor(v_cache, ge_v_cache);
+            
+            graph_inputs.push_back(ge_k_cache);
+            graph_inputs.push_back(ge_v_cache);
+            
+            // 量化场景：添加 scale tensor（可选）
+            auto k_scale = kv_caches[layer].get_k_cache_scale();
+            auto v_scale = kv_caches[layer].get_v_cache_scale();
+            if (k_scale.has_value()) {
+                gert::Tensor ge_k_scale;
+                TorchToDeviceTensor(k_scale.value(), ge_k_scale);
+                graph_inputs.push_back(ge_k_scale);
+            }
+            if (v_scale.has_value()) {
+                gert::Tensor ge_v_scale;
+                TorchToDeviceTensor(v_scale.value(), ge_v_scale);
+                graph_inputs.push_back(ge_v_scale);
+            }
+        }
+        
+        // 4. 添加 attention_mask（如果需要）
+        // ... 根据 epair 文件定义
+        
+        return graph_inputs;
+    }
+    
+    ModelOutput ConvertOutputs(
+        std::vector<gert::Tensor>& graph_outputs) override {
+        
+        ModelOutput result;
+        
+        // graph_outputs[0] = logits
+        if (!graph_outputs.empty()) {
+            TorchFromDeviceTensor(graph_outputs[0], result.logits);
+        }
+        
+        return result;
+    }
+    
+private:
+    // 辅助方法：torch tensor -> gert::Tensor（引用 device memory）
+    bool TorchToDeviceTensor(const torch::Tensor& torch_tensor,
+                             gert::Tensor& ge_tensor);
+    
+    // 辅助方法：gert::Tensor -> torch tensor（拷贝到 host）
+    bool TorchFromDeviceTensor(gert::Tensor& ge_tensor,
+                               torch::Tensor& torch_tensor);
+};
+
+REGISTER_GE_GRAPH_ADAPTER("llm", LLMGeGraphAdapter);
+
+}  // namespace core
+}  // namespace xllm
+```
+
+**关键点**：
+- **解耦**：适配器知道模型特定逻辑，Executor 不关心
+- **可扩展**：新模型只需注册新的适配器
+- **顺序控制**：适配器知道 epair 文件的节点顺序
+- **KVCache 原地更新**：适配器只传入 tensor，不处理更新逻辑
+
+---
+
+### 3. GeGraphExecutorImpl 类
+
+**职责**：
+- 实现 `ExecutorImpl::run()` 接口
+- 通过适配器获取 Graph inputs
+- 执行通用 Graph 逻辑（RunGraph）
+- 不关心输入 tensor 的语义（解耦）
 - 执行 Graph 推理
 - 管理 device memory
 
@@ -540,34 +801,21 @@ public:
     
     ForwardInput prepare_inputs(Batch& batch) override;
     
+    // 实现 ExecutorImpl 接口（通过适配器）
     ModelOutput run(const torch::Tensor& tokens,
                    const torch::Tensor& positions,
                    std::vector<KVCache>& kv_caches,
                    const ModelInputParams& params) override;
     
 private:
-    // Tensor 转换
-    bool TorchToDeviceTensor(const torch::Tensor& torch_tensor,
-                            gert::Tensor& ge_tensor,
-                            DevMem& mem);
+    // 通用 Graph 执行逻辑（解耦）
+    ModelOutput RunGraph(std::vector<gert::Tensor>& graph_inputs);
     
-    bool DeviceTensorToTorch(const gert::Tensor& ge_tensor,
-                            torch::Tensor& torch_tensor);
-    
-    // 准备输入/输出
-    bool PrepareDeviceInputs(const torch::Tensor& tokens,
-                            const torch::Tensor& positions,
-                            std::vector<gert::Tensor>& device_inputs,
-                            std::vector<DevMem>& input_mems);
-    
-bool PrepareDeviceOutputs(std::vector<gert::Tensor>& device_outputs,
+    // 辅助方法
+    bool PrepareDeviceOutputs(std::vector<gert::Tensor>& device_outputs,
                               std::vector<DevMem>& output_mems);
     
-    // KV Cache 处理（新增）
-    bool PrepareKVCacheInputs(std::vector<KVCache>& kv_caches,
-                             std::vector<gert::Tensor>& device_inputs);
-    
-    bool CopyOutputsToHost(const std::vector<gert::Tensor>& device_outputs,
+    bool CopyOutputsToHost(std::vector<gert::Tensor>& device_outputs,
                            ModelOutput& result);
     
     void CleanupTensors(std::vector<gert::Tensor>& tensors,
@@ -575,6 +823,7 @@ bool PrepareDeviceOutputs(std::vector<gert::Tensor>& device_outputs,
     
 private:
     td::EpairModelLoader* loader_;
+    std::unique_ptr<GeGraphInputAdapter> adapter_;  // 适配器（新增）
     std::string graph_key_;
     uint64_t device_id_;
     bool compiled_;
@@ -590,7 +839,7 @@ REGISTER_EXECUTOR("ge", GeGraphExecutorImpl);
 }  // namespace xllm
 ```
 
-#### 构造函数（多卡支持）
+#### 构造函数（适配器 + 多卡支持）
 ```cpp
 GeGraphExecutorImpl::GeGraphExecutorImpl(CausalLM* model,
                                          const ModelArgs& args,
@@ -604,16 +853,24 @@ GeGraphExecutorImpl::GeGraphExecutorImpl(CausalLM* model,
         return;
     }
     
-    // 2. device_id 来自 torch::Device（与 device 绑定）
+    // 2. 创建适配器（根据模型类型）
+    std::string model_type = args.model_type();  // "llm", "vlm", "rec", etc.
+    adapter_ = GeGraphAdapterFactory::Instance().CreateAdapter(model_type);
+    if (adapter_ == nullptr) {
+        LOG(ERROR) << "Failed to create adapter for model_type: " << model_type;
+        return;
+    }
+    
+    // 3. device_id 来自 torch::Device（与 device 绑定）
     device_id_ = device.index();
     
-    // 3. 初始化 GeGraphManager（进程级别，deviceId=0）
+    // 4. 初始化 GeGraphManager（进程级别，deviceId=0）
     if (GeGraphManager::Instance().Initialize() != ge::SUCCESS) {
         LOG(ERROR) << "Failed to initialize GeGraphManager";
         return;
     }
     
-    // 4. 获取或创建该 device 的 Loader（编译阶段 stream=nullptr）
+    // 5. 获取或创建该 device 的 Loader（编译阶段 stream=nullptr）
     std::string epair_path = options.model_path() + "/model.epair";
     graph_key_ = options.model_path();
     
@@ -628,18 +885,21 @@ GeGraphExecutorImpl::GeGraphExecutorImpl(CausalLM* model,
     }
     
     compiled_ = true;
-    LOG(INFO) << "GeGraphExecutorImpl initialized for device " << device_id_;
+    LOG(INFO) << "GeGraphExecutorImpl initialized for device " << device_id_
+              << " with adapter " << adapter_->GetName();
 }
 ```
 
 **关键点**：
+- **适配器创建**：根据 `args.model_type()` 创建对应的适配器
+- **解耦**：Executor 不关心模型特定逻辑，适配器负责
 - **device 绑定**：`device_id_` 来自 `torch::Device.index()`
 - **进程级别初始化**：`Initialize()` 不传参数（默认 deviceId=0）
 - **多卡 Loader**：`GetOrCreateLoader()` 传入 `device_id_`，指定该 device 的 Loader
 - **编译阶段 stream**：GetOrCreateLoader 内部调用 `CompileAndLoad({...}, nullptr)`
 - **执行阶段 stream**：run() 时通过 `getCurrentNPUStream` 获取真正的 stream
 
-#### run()（优化版，避免 H2D 拷贝）
+#### run()（使用适配器，解耦）
 ```cpp
 ModelOutput GeGraphExecutorImpl::run(const torch::Tensor& tokens,
                                      const torch::Tensor& positions,
@@ -650,72 +910,73 @@ ModelOutput GeGraphExecutorImpl::run(const torch::Tensor& tokens,
         return ModelOutput();
     }
     
+    // 1. 使用适配器转换模型特定参数 -> Graph inputs
+    std::vector<gert::Tensor> graph_inputs = 
+        adapter_->PrepareInputs(tokens, positions, kv_caches, params);
+    
+    if (graph_inputs.empty()) {
+        LOG(ERROR) << "Adapter failed to prepare inputs";
+        return ModelOutput();
+    }
+    
+    // 2. 执行通用 Graph 逻辑（解耦）
+    return RunGraph(graph_inputs);
+}
+```
+
+**关键点**：
+- **解耦**：通过适配器转换参数，Executor 不关心模型特定逻辑
+- **简化**：run() 方法只做参数转换 + Graph 执行
+
+#### RunGraph()（通用 Graph 执行逻辑）
+```cpp
+ModelOutput GeGraphExecutorImpl::RunGraph(std::vector<gert::Tensor>& graph_inputs) {
     // 1. 获取 stream
     aclrtStream stream = c10_npu::getCurrentNPUStream(device_id_).stream();
     
-    // 2. 准备输入 tensors（直接使用 device memory，无 H2D 拷贝）
-    std::vector<gert::Tensor> device_inputs;
-    
-    // tokens tensor（已在 device memory）
-    gert::Tensor ge_tokens;
-    if (!TorchToDeviceTensor(tokens, ge_tokens)) {
-        LOG(ERROR) << "Failed to convert tokens tensor";
-        return ModelOutput();
-    }
-    device_inputs.push_back(ge_tokens);
-    
-    // positions tensor（已在 device memory）
-    gert::Tensor ge_positions;
-    if (!TorchToDeviceTensor(positions, ge_positions)) {
-        LOG(ERROR) << "Failed to convert positions tensor";
-        return ModelOutput();
-    }
-    device_inputs.push_back(ge_positions);
-    
-    // 注意：输入 tensor 不需要 DevMem，torch tensor 自动管理
-    
-    // 3. 准备输出 tensors（预分配）
+    // 2. 准备输出 tensors（预分配）
     std::vector<gert::Tensor> device_outputs;
     std::vector<DevMem> output_mems;
+    
+    size_t output_count = adapter_->GetOutputCount();
+    device_outputs.resize(output_count);
+    output_mems.resize(output_count);
+    
+    // 预分配输出 memory（具体 shape 由适配器或 epair 文件决定）
     if (!PrepareDeviceOutputs(device_outputs, output_mems)) {
         LOG(ERROR) << "Failed to prepare device outputs";
         return ModelOutput();
     }
     
-    // 4. 执行推理
-    if (loader_->RunModelWithStreamAsync(stream, device_inputs, device_outputs) 
+    // 3. 执行 Graph
+    if (loader_->RunModelWithStreamAsync(stream, graph_inputs, device_outputs) 
         != td::SUCCESS) {
         LOG(ERROR) << "RunModelWithStreamAsync failed";
-        CleanupTensors(device_outputs, output_mems);  // 只清理输出
+        CleanupTensors(device_outputs, output_mems);
         return ModelOutput();
     }
     
-    // 5. 同步
+    // 4. 同步
     if (aclrtSynchronizeStream(stream) != ACL_SUCCESS) {
         LOG(ERROR) << "aclrtSynchronizeStream failed";
         CleanupTensors(device_outputs, output_mems);
         return ModelOutput();
     }
     
-    // 6. 获取输出
-    ModelOutput result;
-    if (!CopyOutputsToHost(device_outputs, result)) {
-        LOG(ERROR) << "Failed to copy outputs to host";
-        CleanupTensors(device_outputs, output_mems);
-        return ModelOutput();
-    }
+    // 5. 使用适配器转换 Graph outputs -> ModelOutput
+    ModelOutput result = adapter_->ConvertOutputs(device_outputs);
     
-    // 7. 清理输出 tensors（输入 tensors 不需要清理）
+    // 6. 清理输出 tensors（输入 tensors 不需要清理，由 torch 管理）
     CleanupTensors(device_outputs, output_mems);
     
     return result;
 }
 ```
 
-**关键优化**：
-- **输入 tensor**：直接使用 torch tensor 的 device memory，无 H2D 拷贝
-- **输出 tensor**：预分配 device memory，需要手动清理
-- **性能提升**：减少 H2D 拷贝开销（~100us per tensor）
+**关键点**：
+- **通用逻辑**：不关心输入 tensor 的语义，只执行 Graph
+- **适配器解耦**：输出转换由适配器处理
+- **性能优化**：输入 tensor 使用 torch 的 device memory，无需手动管理
 
 #### TorchToDeviceTensor()（优化版，避免 H2D 拷贝）
 ```cpp
@@ -944,11 +1205,11 @@ public:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### PrepareKVCacheInputs() 实现
+### KVCache 原地更新机制总结
 
 **核心理解**：
 - GeGraphExecutorImpl **不需要处理 KVCache 更新逻辑**
-- 只需要把 KVCache tensor 作为**输入**传给 Graph
+- 只需要把 KVCache tensor 作为**输入**传给 Graph（通过适配器）
 - Graph 内部算子（如 `reshape_paged_cache`）会**自动修改**这些 tensor 的内容
 - 类似于传引用机制：`gert::Tensor` 只引用 device memory，Graph 内部直接修改
 
@@ -961,131 +1222,19 @@ def graph_forward(input_ids, position_ids, past_k_cache, past_v_cache):
     return logits  # 只返回 logits，past_k_cache/v_cache 已被自动更新
 ```
 
-**实现代码**：
-```cpp
-bool GeGraphExecutorImpl::PrepareKVCacheInputs(
-    std::vector<KVCache>& kv_caches,
-    std::vector<gert::Tensor>& device_inputs) {
-    
-    for (size_t layer = 0; layer < kv_caches.size(); ++layer) {
-        // 1. 获取 key cache tensor（已在 device memory）
-        torch::Tensor k_cache = kv_caches[layer].get_k_cache();
-        if (!k_cache.defined()) {
-            LOG(ERROR) << "k_cache not defined for layer " << layer;
-            return false;
-        }
-        
-        // 2. 获取 value cache tensor（已在 device memory）
-        torch::Tensor v_cache = kv_caches[layer].get_v_cache();
-        if (!v_cache.defined()) {
-            LOG(ERROR) << "v_cache not defined for layer " << layer;
-            return false;
-        }
-        
-        // 3. 转换为 gert::Tensor（引用 device memory，不拷贝）
-        gert::Tensor ge_k_cache;
-        if (!TorchToDeviceTensor(k_cache, ge_k_cache)) {
-            LOG(ERROR) << "Failed to convert k_cache for layer " << layer;
-            return false;
-        }
-        
-        gert::Tensor ge_v_cache;
-        if (!TorchToDeviceTensor(v_cache, ge_v_cache)) {
-            LOG(ERROR) << "Failed to convert v_cache for layer " << layer;
-            return false;
-        }
-        
-        // 4. 作为 Graph 输入传入（Graph 内部算子会自动修改这些 tensor）
-        device_inputs.push_back(ge_k_cache);
-        device_inputs.push_back(ge_v_cache);
-        
-        // 5. 如果是量化场景，处理 scale tensor（可选）
-        auto k_scale = kv_caches[layer].get_k_cache_scale();
-        if (k_scale.has_value()) {
-            gert::Tensor ge_k_scale;
-            if (!TorchToDeviceTensor(k_scale.value(), ge_k_scale)) {
-                LOG(ERROR) << "Failed to convert k_scale for layer " << layer;
-                return false;
-            }
-            device_inputs.push_back(ge_k_scale);
-        }
-        
-        auto v_scale = kv_caches[layer].get_v_cache_scale();
-        if (v_scale.has_value()) {
-            gert::Tensor ge_v_scale;
-            if (!TorchToDeviceTensor(v_scale.value(), ge_v_scale)) {
-                LOG(ERROR) << "Failed to convert v_scale for layer " << layer;
-                return false;
-            }
-            device_inputs.push_back(ge_v_scale);
-        }
-    }
-    
-    return true;
-}
-```
+**架构变化**：
+- **旧设计**：`GeGraphExecutorImpl::PrepareKVCacheInputs()`（与模型耦合）
+- **新设计**：`LLMGeGraphAdapter::PrepareInputs()`（适配器处理，Executor 解耦）
 
 **关键点**：
-- **GeGraphExecutorImpl 职责**：只是把 KVCache tensor 转换为 gert::Tensor 并传入 Graph
+- **GeGraphExecutorImpl 职责**：只执行通用 Graph 逻辑（RunGraph）
+- **适配器职责**：把模型特定参数转换成 Graph inputs（包括 KVCache）
 - **KVCache 更新机制**：Graph 内部算子自动处理，Executor 不关心
 - **无内存管理**：KVCache tensor 由 `kv_caches` 管理，Executor 不持有所有权
-- **无 H2D 拷贝**：直接引用 device memory（`data_ptr()`）
-- **量化支持**：可选的 scale tensor
 
-### run() 方法集成 KV Cache
+---
 
-```cpp
-ModelOutput GeGraphExecutorImpl::run(const torch::Tensor& tokens,
-                                     const torch::Tensor& positions,
-                                     std::vector<KVCache>& kv_caches,
-                                     const ModelInputParams& params) {
-    if (!compiled_) {
-        LOG(ERROR) << "Graph not compiled";
-        return ModelOutput();
-    }
-    
-    // 1. 获取 stream
-    aclrtStream stream = c10_npu::getCurrentNPUStream(device_id_).stream();
-    
-    // 2. 准备输入 tensors
-    std::vector<gert::Tensor> device_inputs;
-    
-    // 2.1 基础输入（tokens, positions）
-    gert::Tensor ge_tokens, ge_positions;
-    if (!TorchToDeviceTensor(tokens, ge_tokens) ||
-        !TorchToDeviceTensor(positions, ge_positions)) {
-        LOG(ERROR) << "Failed to convert input tensors";
-        return ModelOutput();
-    }
-    device_inputs.push_back(ge_tokens);
-    device_inputs.push_back(ge_positions);
-    
-    // 2.2 KV Cache 输入（关键新增）
-    if (!kv_caches.empty()) {
-        if (!PrepareKVCacheInputs(kv_caches, device_inputs)) {
-            LOG(ERROR) << "Failed to prepare KV cache inputs";
-            return ModelOutput();
-        }
-    }
-    
-    // 3. 准备输出 tensors（预分配）
-    std::vector<gert::Tensor> device_outputs;
-    std::vector<DevMem> output_mems;
-    if (!PrepareDeviceOutputs(device_outputs, output_mems)) {
-        LOG(ERROR) << "Failed to prepare device outputs";
-        return ModelOutput();
-    }
-    
-    // 4. 执行 Graph
-    if (loader_->RunModelWithStreamAsync(stream, device_inputs, device_outputs) 
-        != td::SUCCESS) {
-        LOG(ERROR) << "RunModelWithStreamAsync failed";
-        CleanupTensors(device_outputs, output_mems);
-        return ModelOutput();
-    }
-    
-    // 5. 同步
-    if (aclrtSynchronizeStream(stream) != ACL_SUCCESS) {
+## 待确认事项
         LOG(ERROR) << "aclrtSynchronizeStream failed";
         CleanupTensors(device_outputs, output_mems);
         return ModelOutput();
@@ -1221,7 +1370,17 @@ xllm/core/runtime/
 ├── ge_graph_manager.cpp            # GeGraphManager 实现
 ├── ge_graph_executor_impl.h       # GeGraphExecutorImpl 定义
 ├── ge_graph_executor_impl.cpp     # GeGraphExecutorImpl 实现
+├── ge_graph_input_adapter.h       # GeGraphInputAdapter 抽象基类
+├── ge_graph_adapter_factory.h     # GeGraphAdapterFactory 工厂类
+├── ge_graph_adapter_factory.cpp   # GeGraphAdapterFactory 实现
 └── executor_impl_factory.h        # 添加 REGISTER_EXECUTOR("ge", GeGraphExecutorImpl)
+
+xllm/core/runtime/adapters/        # 适配器子目录（新增）
+├── llm_ge_graph_adapter.h         # LLM 模型适配器
+├── llm_ge_graph_adapter.cpp       # LLM 适配器实现
+├── vlm_ge_graph_adapter.h         # VLM 模型适配器（未来）
+├── vlm_ge_graph_adapter.cpp       # VLM 适配器实现（未来）
+└── rec_ge_graph_adapter.h         # 推荐模型适配器（未来）
 ```
 
 ---
@@ -1285,19 +1444,22 @@ target_link_libraries(xllm
 
 ### Phase 1：基础实现（当前）
 - [ ] 实现 `GeGraphManager` 单例类
-- [ ] 实现 `GeGraphExecutorImpl` 基础版本
+- [ ] 实现 `GeGraphInputAdapter` 抽象基类 + 工厂模式
+- [ ] 实现 `LLMGeGraphAdapter`（基础版，只处理 tokens/positions）
+- [ ] 实现 `GeGraphExecutorImpl` 基础版本（使用适配器）
 - [ ] Tensor 内存管理
 - [ ] 单元测试
 - [ ] 集成测试
 
 ### Phase 2：KV Cache 支持
-- [ ] 实现 `PrepareKVCacheInputs()` 方法
+- [ ] 在 `LLMGeGraphAdapter` 中添加 KV Cache 支持
   - 遍历 `kv_caches` 按层获取 k/v cache tensor
   - 转换为 `gert::Tensor`（无 H2D 拷贝）
   - 支持量化场景的 scale tensor
   
 - [ ] 确认 epair 文件的 Graph 输入节点顺序
   - 确定 KV Cache tensor 在输入列表中的位置
+  - 调整 `LLMGeGraphAdapter::PrepareInputs()` 的添加顺序
   - 调整 `PrepareKVCacheInputs()` 的添加顺序
   
 - [ ] 实现输出 KV Cache 处理
