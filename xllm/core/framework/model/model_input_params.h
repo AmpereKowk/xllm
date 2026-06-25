@@ -1074,6 +1074,12 @@ struct ModelInputParams {
 
   // Flag for graph capture/replay mode.
   bool enable_graph = false;
+
+  // Graph input tensor map for GE graph execution.
+  // key: Graph input node name
+  // value: torch::Tensor (will be converted to gert::Tensor by EpModel)
+  // Used by EpModel to build graph inputs from caller-provided tensors.
+  std::unordered_map<std::string, torch::Tensor> input_tensor_map;
 };
 
 }  // namespace xllm

@@ -73,6 +73,8 @@ DEFINE_COUNTER(detokenization_latency_seconds_non_stream,
 // executor metrics
 DEFINE_COUNTER(num_model_execution_total_eager,
                "Total number of model execution");
+DEFINE_COUNTER(num_model_execution_total_ge_graph,
+               "Total number of GE graph model execution");
 
 // worker metrics
 DEFINE_COUNTER(execution_latency_seconds_model,

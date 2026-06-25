@@ -139,6 +139,7 @@ DECLARE_HISTOGRAM(prefix_cache_block_matched_num);
 
 // total number of model execution operations
 DECLARE_COUNTER(num_model_execution_total_eager);
+DECLARE_COUNTER(num_model_execution_total_ge_graph);
 
 // latency of worker execution operations in seconds
 DECLARE_COUNTER(execution_latency_seconds_model);
