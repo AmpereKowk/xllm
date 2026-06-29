@@ -924,9 +924,317 @@ RecEngine::step()
         └─> batch.finish()
 ```
 
-### 10.3 GeGraphEnginePipeline 设计
+### 10.3 GeGraphMasterPipeline 设计
 
-#### 10.3.1 职责
+#### 10.3.1 四层 Pipeline 全景
+
+Rec 推理链路共有四层 Pipeline 抽象，GE 图模式需要在每一层都提供对应实现：
+
+```
+Layer 1: RecMasterPipeline    → 请求构造 (API 输入 → Request)
+Layer 2: RecEnginePipeline    → 引擎编排 (Batch → ForwardInput → ForwardOutput)
+Layer 3: RecWorkPipeline      → Worker 计算 (ForwardInput → executor→forward → ForwardOutput)
+Layer 4: SchedulerPipeline     → 调度批处理 (Sequence → Batch)
+```
+
+各层现有实例与 GE 图模式的映射关系：
+
+```
+RecPipelineType              → MasterPipeline                    → EnginePipeline                     → WorkPipeline                      → SchedulerPipeline
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+kLlmRecDefault               → LlmRecMasterPipeline              → LlmRecEnginePipeline               → LlmRecWorkPipeline                → LlmRecSchedulerPipeline
+kLlmRecWithMmData            → LlmRecWithMmDataMasterPipeline    → (复用 LlmRec)                      → LlmRecWithMmDataWorkPipeline      → (复用 LlmRec)
+kLlmRecMultiRoundPipeline    → LlmRecMasterPipeline (复用)       → RecMultiRoundEnginePipeline        → LlmRecMultiRoundPipeline          → RecMultiRoundSchedulerPipeline
+kOneRecDefault               → OneRecPrefillOnlyMasterPipeline   → OneRecPrefillOnlyEnginePipeline    → OneRecWorkPipeline                → OneRecSchedulerPipeline
+kOneRecXAttentionPipeline    → OneRecXAttentionMasterPipeline    → OneRecXAttentionEnginePipeline     → OneRecXAttentionWorkPipeline      → OneRecXAttentionSchedulerPipeline
+kGeGraphPipeline (新增)      → GeGraphMasterPipeline (新增)      → GeGraphEnginePipeline (新增)       → GeGraphWorkerPipeline (新增)      → GeGraphSchedulerPipeline (新增)
+```
+
+#### 10.3.2 RecMasterPipeline 的职责
+
+`RecMasterPipeline` 是请求构造层的策略抽象，负责将外部 API 输入（prompt、token_ids、input_tensors、MMData）转换为内部 `Request` 对象。
+
+**核心方法**：
+```cpp
+class RecMasterPipeline {
+public:
+    // prompt 输入方式
+    virtual std::shared_ptr<Request> generate_request(
+        std::string prompt,
+        std::optional<std::vector<int>> prompt_tokens,
+        std::optional<std::vector<proto::InferInputTensor>> input_tensors,
+        const RequestParams& sp,
+        OutputCallback callback);
+
+    // raw 输入方式（token_ids + MMData）
+    virtual std::shared_ptr<Request> generate_request(
+        const std::vector<int>& prompt_tokens,
+        std::optional<MMData> mm_data,
+        const RequestParams& sp,
+        OutputCallback callback);
+};
+```
+
+**与 Engine/Worker Pipeline 的本质区别**：
+- Master Pipeline 不参与模型执行，只负责请求构造
+- 不涉及 `step()`、`prepare_inputs()`、`prepare_work_before_execute()` 等执行方法
+- 输出是 `std::shared_ptr<Request>`，而非 `ForwardOutput`
+
+#### 10.3.3 GE 图模式下的核心差异
+
+GE 图内部自行完成 **sampling + beam search + 多轮 decode + 停止判断**，这导致 Master 层的 Request 构造与现有 Pipeline 存在以下关键差异：
+
+| 维度 | 现有 Pipeline | GE 图模式 | 影响 |
+|------|-------------|----------|------|
+| **StoppingChecker** | `build_stop_checker=true`（LlmRec/XAttention）或 `false`（PrefillOnly），Host 逐步检查 | **必须 `false`**——图内部控制停止，Host 无法逐步检查 | `build_request_common()` 参数 |
+| **停止条件传递** | 由 Host 侧 `StoppingChecker::check()` 每步执行 | 需要把 `max_tokens`、`eos_token_id`、`stop_token_ids` **作为图输入 Tensor** 传入 GE 图 | Request 需要携带这些元数据到图 |
+| **Sampling 参数** | 聚合成 per-token 张量（`temperatures`、`top_p`、`top_k` 等 batch 张量） | 图内处理采样，需要的是**标量配置**而非 per-token 张量 | `SamplingParameters::init()` 的聚合逻辑对 GE 图是冗余的 |
+| **beam_width / num_return_sequences** | Host 侧驱动 beam 扩展、`SequencesGroup::process_beam_search()` | 图内完成 beam search，Host **不应** 做 beam 扩展 | `Sequence` 生命周期管理 |
+| **Sequence 生命周期** | `append_token()` → `finished()` → `process_beam_search()` 循环 | 图一次性返回完整结果，Sequence **不走逐步循环** | Scheduler/Engine 层的 Sequence 管理 |
+| **max_tokens** | 用于 `StoppingChecker` + `seq_capacity` 计算 | 同时作为图的 **最大 decode 步数** 输入 | 需要额外传递到图 |
+
+#### 10.3.4 StoppingChecker 的悖论
+
+```
+现有模式:
+  Request → Sequence → 每步 append_token → StoppingChecker::check() → 决定是否终止
+
+GE 图模式:
+  Request → Sequence → 一次性 forward → 图内部循环 decode + 停止 → 返回完整结果
+                                            ↑
+                                   图怎么知道什么时候停？
+                                   → 需要 max_tokens / eos_token_id / stop_token_ids 作为图输入
+```
+
+`StoppingChecker` 在 GE 图模式下有双重角色：
+1. **不构建** Host 侧的 `StoppingChecker` 对象（`build_stop_checker=false`）
+2. **但要保留** 停止条件的原始数据（`max_tokens`、`eos_token_id`、`stop_token_ids`），让它们能流到图输入
+
+**当前问题**：`build_request_common()` 中，`max_tokens`、`eos_token_id`、`stop_token_ids` 在构建完 `StoppingChecker` 后就丢弃了。GE 图模式需要在 `RequestState` 中保留它们。
+
+#### 10.3.5 数据流差异
+
+```
+现有模式:
+  RequestParams
+    ├─ max_tokens ──→ StoppingChecker (Host 逐步检查)
+    ├─ beam_width ──→ RequestSamplingParam ──→ SamplingParameters (per-token 张量)
+    ├─ temperature ─→ RequestSamplingParam ──→ SamplingParameters (per-token 张量)
+    └─ stop_token_ids → StoppingChecker (Host 逐步检查)
+
+GE 图模式:
+  RequestParams
+    ├─ max_tokens ──→ RequestState 保留 ──→ input_tensor_map["max_decode_steps"]
+    ├─ beam_width ──→ RequestState 保留 ──→ input_tensor_map["beam_width"]
+    ├─ temperature ─→ RequestState 保留 ──→ input_tensor_map["temperature"]
+    ├─ eos_token_id → RequestState 保留 ──→ input_tensor_map["eos_token_id"]
+    └─ stop_token_ids → RequestState 保留 ──→ input_tensor_map["stop_token_ids"]
+```
+
+#### 10.3.6 GeGraphMasterPipeline 类定义
+
+```cpp
+class GeGraphMasterPipeline final : public RecMasterPipeline {
+public:
+    explicit GeGraphMasterPipeline(RecMaster& master)
+        : RecMasterPipeline(master) {}
+    ~GeGraphMasterPipeline() override = default;
+
+    std::shared_ptr<Request> generate_request(
+        std::string prompt,
+        std::optional<std::vector<int>> prompt_tokens,
+        std::optional<std::vector<proto::InferInputTensor>> input_tensors,
+        const RequestParams& sp,
+        OutputCallback callback) override;
+};
+```
+
+#### 10.3.7 generate_request() 实现
+
+```cpp
+std::shared_ptr<Request> GeGraphMasterPipeline::generate_request(
+    std::string prompt,
+    std::optional<std::vector<int>> prompt_tokens,
+    std::optional<std::vector<proto::InferInputTensor>> input_tensors,
+    const RequestParams& sp,
+    OutputCallback callback) {
+
+    // 1. tokenize (复用 LlmRec 逻辑)
+    std::vector<int> local_prompt_tokens;
+    if (prompt_tokens.has_value()) {
+        local_prompt_tokens = prompt_tokens.value();
+    } else {
+        local_prompt_tokens = master_.tokenizer_->encode(prompt);
+    }
+
+    if (local_prompt_tokens.empty()) {
+        LOG(ERROR) << "Empty prompt tokens";
+        return nullptr;
+    }
+
+    // 2. 构建 Request (关键差异: build_stop_checker=false)
+    return master_.build_request_common(
+        prompt,
+        local_prompt_tokens,
+        /*mm_data=*/std::nullopt,
+        sp,
+        callback,
+        /*build_stop_checker=*/false);  // ← 关键：不构建 Host 侧 StoppingChecker
+}
+```
+
+**设计要点**：
+- `build_stop_checker=false`：GE 图内部控制停止，Host 不需要逐步检查
+- 复用 `build_request_common()` 的 `RequestState` 构建逻辑
+- 停止条件和采样配置的原始数据需要保留在 `RequestState` 中（见 10.3.8）
+
+#### 10.3.8 RequestState 扩展
+
+GE 图模式需要在 `RequestState` 中保留停止条件和采样配置的原始数据，以便后续流转到图输入：
+
+```cpp
+struct RequestState {
+    // ... 已有字段 ...
+
+    // 新增：GE 图模式需要的原始配置数据
+    // 这些数据当前仅在构建 StoppingChecker 时使用，之后被丢弃
+    // GE 图模式需要将它们保留并传递到图输入
+    uint32_t max_tokens = 0;                    // 最大生成 token 数 → 图输入 max_decode_steps
+    int32_t eos_token_id = -1;                  // EOS token ID → 图输入 eos_token_id
+    std::unordered_set<int32_t> stop_token_ids; // 停止 token 集合 → 图输入 stop_token_ids
+    std::vector<std::vector<int32_t>> stop_sequences; // 停止序列 → 图输入 stop_sequences
+
+    // 采样配置标量（当前仅在 SamplingParameters::init() 中聚合为张量）
+    // GE 图模式需要标量形式作为图输入
+    float temperature = 0.0;                    // → 图输入 temperature
+    float top_p = 1.0;                          // → 图输入 top_p
+    int64_t top_k = -1;                         // → 图输入 top_k
+    float repetition_penalty = 1.0;             // → 图输入 repetition_penalty
+};
+```
+
+**`build_request_common()` 修改**：
+
+```cpp
+// 在 build_request_common() 中，构建 RequestState 时保留原始数据
+RequestState state;
+// ... 已有字段赋值 ...
+
+// 新增：保留 GE 图模式需要的原始数据
+state.max_tokens = max_tokens;
+state.eos_token_id = eos_token_id;
+state.stop_token_ids = stop_tokens;
+state.stop_sequences = stop_sequences;
+state.temperature = sp.temperature;
+state.top_p = sp.top_p;
+state.top_k = sp.top_k;
+state.repetition_penalty = sp.repetition_penalty;
+```
+
+#### 10.3.9 GeGraphSchedulerPipeline
+
+GE 图模式还需要对应的 SchedulerPipeline，负责 Batch 构造和 KV Cache 分配：
+
+```cpp
+class GeGraphSchedulerPipeline final : public SchedulerPipeline {
+public:
+    explicit GeGraphSchedulerPipeline() = default;
+
+    std::vector<Batch> create_batches(FixedStepsScheduler& scheduler,
+                                       BatchFactory* batch_factory) override;
+
+    bool requires_kv_cache() const override { return true; }
+
+    bool allocate_kv_cache(KVCacheManager* kv_cache_manager,
+                            Sequence* sequence) override;
+};
+```
+
+**与现有 SchedulerPipeline 的差异**：
+- `requires_kv_cache()` 返回 `true`（GE 图需要 KV Cache）
+- `create_batches()` 逻辑与 `LlmRecSchedulerPipeline` 类似
+- `allocate_kv_cache()` 需要为 GE 图的特殊 KV Cache 布局分配（如果有的话）
+
+#### 10.3.10 工厂映射扩展
+
+**RecMaster::create_pipeline**：
+```cpp
+std::unique_ptr<RecMasterPipeline> RecMaster::create_pipeline(
+    RecPipelineType type, RecMaster& master) {
+    switch (type) {
+        case RecPipelineType::kLlmRecDefault:
+        case RecPipelineType::kLlmRecMultiRoundPipeline:
+            return std::make_unique<LlmRecMasterPipeline>(master);
+        case RecPipelineType::kLlmRecWithMmData:
+            return std::make_unique<LlmRecWithMmDataMasterPipeline>(master);
+        case RecPipelineType::kOneRecDefault:
+            return std::make_unique<OneRecPrefillOnlyMasterPipeline>(master);
+        case RecPipelineType::kOneRecXAttentionPipeline:
+            return std::make_unique<OneRecXAttentionMasterPipeline>(master);
+        case RecPipelineType::kGeGraphPipeline:          // 新增
+            return std::make_unique<GeGraphMasterPipeline>(master);
+        default:
+            LOG(FATAL) << "Unknown pipeline type";
+            return nullptr;
+    }
+}
+```
+
+**FixedStepsScheduler::create_pipeline**：
+```cpp
+std::unique_ptr<SchedulerPipeline> FixedStepsScheduler::create_pipeline(
+    RecPipelineType type) {
+    switch (type) {
+        case RecPipelineType::kLlmRecDefault:
+            return std::make_unique<LlmRecSchedulerPipeline>();
+        case RecPipelineType::kOneRecDefault:
+            return std::make_unique<OneRecSchedulerPipeline>();
+        case RecPipelineType::kOneRecXAttentionPipeline:
+            return std::make_unique<OneRecXAttentionSchedulerPipeline>();
+        case RecPipelineType::kLlmRecMultiRoundPipeline:
+            return std::make_unique<RecMultiRoundSchedulerPipeline>();
+        case RecPipelineType::kGeGraphPipeline:          // 新增
+            return std::make_unique<GeGraphSchedulerPipeline>();
+        default:
+            LOG(FATAL) << "Unknown pipeline type";
+            return nullptr;
+    }
+}
+```
+
+#### 10.3.11 对 Sequence 生命周期的影响
+
+GE 图模式下，Sequence 的生命周期与现有模式有本质区别：
+
+**现有模式**：
+```
+Sequence 创建
+  → Scheduler 加入 Batch
+  → Engine step() → Worker forward() → 返回 1 个 token
+  → Sequence::append_token()
+  → StoppingChecker::check() → 未完成则继续
+  → 循环直到完成
+```
+
+**GE 图模式**：
+```
+Sequence 创建
+  → Scheduler 加入 Batch
+  → Engine step() → Worker forward() → 图内完成全部 decode
+  → 返回完整结果 (beam_sequence_group)
+  → Batch::process_beam_sequence_group() 一次性写入所有 token
+  → Sequence 直接标记为 FINISHED
+```
+
+**关键影响**：
+- Sequence 不经历逐步的 `append_token()` → `finished()` 循环
+- `StoppingChecker` 不参与 Host 侧检查
+- `SequencesGroup::process_beam_search()` 不执行（图内已完成）
+- Scheduler 不需要在多个 step 之间维护 Sequence 状态
+
+### 10.4 GeGraphEnginePipeline 设计
+
+#### 10.4.1 职责
 
 `GeGraphEnginePipeline` 是 `RecEnginePipeline` 的子类，负责 Engine 层的推理编排。其职责仅限于：
 
@@ -940,7 +1248,7 @@ RecEngine::step()
 - 不执行 beam search 后处理（图内完成，输出已是最终结果）
 - 不执行 sampling（图内完成）
 
-#### 10.3.2 类定义
+#### 10.4.2 类定义
 
 ```cpp
 class GeGraphEnginePipeline final : public RecEnginePipeline {
@@ -971,7 +1279,7 @@ private:
 };
 ```
 
-#### 10.3.3 step() 流程
+#### 10.4.3 step() 流程
 
 ```
 GeGraphEnginePipeline::step(batches)
@@ -1007,7 +1315,7 @@ GeGraphEnginePipeline::step(batches)
 | finish | `batch.finish()` | 相同 |
 | Worker 内部 | 多轮 decode 循环 + sampling + beam search | 单次 `executor->forward()`，图内完成一切 |
 
-#### 10.3.4 Worker 管理
+#### 10.4.4 Worker 管理
 
 Worker 初始化逻辑复用 `OneRecLocalEnginePipeline` / `RecMultiRoundEnginePipeline` 的本地 Worker 模式：
 
@@ -1038,9 +1346,9 @@ bool GeGraphEnginePipeline::init_model_workers(const std::string& model_path) {
 }
 ```
 
-### 10.4 GeGraphWorkerPipeline 设计
+### 10.5 GeGraphWorkerPipeline 设计
 
-#### 10.4.1 职责
+#### 10.5.1 职责
 
 `GeGraphWorkerPipeline` 是 `RecWorkPipeline` 的子类，负责 Worker 层的推理执行。其职责仅限于：
 
@@ -1055,7 +1363,7 @@ bool GeGraphEnginePipeline::init_model_workers(const std::string& model_path) {
 - 不需要多轮循环（图内完成多轮 decode）
 - 不需要每轮修改 `input_params` / `token_ids` / `positions`
 
-#### 10.4.2 类定义
+#### 10.5.2 类定义
 
 ```cpp
 class GeGraphWorkerPipeline final : public RecWorkPipeline {
@@ -1072,7 +1380,7 @@ public:
 };
 ```
 
-#### 10.4.3 prepare_inputs()
+#### 10.5.3 prepare_inputs()
 
 复用基类 `RecWorkPipeline::prepare_inputs()` 逻辑，将 Batch 转换为 `ForwardInput`：
 
@@ -1082,9 +1390,9 @@ ForwardInput GeGraphWorkerPipeline::prepare_inputs(Batch& batch) {
 }
 ```
 
-#### 10.4.4 prepare_work_before_execute()
+#### 10.5.4 prepare_work_before_execute()
 
-在 Base 逻辑（H2D + KV block swap）基础上，通过 **Schema 驱动** 填充 `input_tensor_map`（详见 10.11 节）：
+在 Base 逻辑（H2D + KV block swap）基础上，通过 **Schema 驱动** 填充 `input_tensor_map`（详见 10.12 节）：
 
 ```cpp
 void GeGraphWorkerPipeline::prepare_work_before_execute(
@@ -1120,7 +1428,7 @@ void GeGraphWorkerPipeline::prepare_work_before_execute(
 - 通用 `GeGraphInputBuilder` 按 Schema 从标准运行时数据中取数据
 - 仅 `kCustom` 类输入需要 Model 子类 override `PrepareCustomInputs()`
 
-#### 10.4.5 step()
+#### 10.5.5 step()
 
 单次 forward，构造 `ForwardOutput`：
 
@@ -1156,7 +1464,7 @@ std::optional<ForwardOutput> GeGraphWorkerPipeline::step(const ForwardInput& inp
 }
 ```
 
-#### 10.4.6 ForwardInput 字段消费矩阵
+#### 10.5.6 ForwardInput 字段消费矩阵
 
 | 字段 | GeGraph 使用方式 | 对比 Base RecWorkPipeline |
 |------|-----------------|--------------------------|
@@ -1173,7 +1481,7 @@ std::optional<ForwardOutput> GeGraphWorkerPipeline::step(const ForwardInput& inp
 | `transfer_kv_infos` | **忽略** | READ |
 | `onerec_params` / `llmrec_params` | **忽略** | 各 Pipeline 按需 READ |
 
-#### 10.4.7 与现有 WorkPipeline 的对比
+#### 10.5.7 与现有 WorkPipeline 的对比
 
 | 维度 | Base RecWorkPipeline | OneRecXAttention | LlmRecMultiRound | **GeGraph** |
 |------|---------------------|------------------|------------------|-------------|
@@ -1184,7 +1492,7 @@ std::optional<ForwardOutput> GeGraphWorkerPipeline::step(const ForwardInput& inp
 | input_params 修改 | 无 | 拷贝+改 flag | 每轮原地修改 | **无** |
 | 输出格式 | `sample_output` | `beam_sequence_group` | `beam_sequence_group` | **`beam_sequence_group`** |
 
-### 10.5 数据流图
+### 10.6 数据流图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -1268,9 +1576,9 @@ std::optional<ForwardOutput> GeGraphWorkerPipeline::step(const ForwardInput& inp
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 10.6 RecPipelineType 扩展
+### 10.7 RecPipelineType 扩展
 
-#### 10.6.1 新增枚举值
+#### 10.7.1 新增枚举值
 
 ```cpp
 enum class RecPipelineType : uint8_t {
@@ -1283,7 +1591,7 @@ enum class RecPipelineType : uint8_t {
 };
 ```
 
-#### 10.6.2 工厂方法扩展
+#### 10.7.2 工厂方法扩展
 
 **RecEngine::create_pipeline**：
 ```cpp
@@ -1329,7 +1637,7 @@ std::unique_ptr<RecWorkPipeline> RecWorkerImpl::create_pipeline(
 }
 ```
 
-#### 10.6.3 Pipeline 类型选择逻辑
+#### 10.7.3 Pipeline 类型选择逻辑
 
 ```cpp
 RecPipelineType get_rec_pipeline_type(RecModelKind kind, 
@@ -1354,13 +1662,13 @@ RecPipelineType get_rec_pipeline_type(RecModelKind kind,
 }
 ```
 
-### 10.7 ModelOutput 扩展
+### 10.8 ModelOutput 扩展
 
-#### 10.7.1 问题
+#### 10.8.1 问题
 
 当前 `ModelOutput` 主要承载 `logits`（hidden states），由 WorkPipeline 中的 Sampler 和 BeamSearcher 处理后生成 `ForwardOutput`。但在 GE 图模式下，图输出已经是最终的 beam search 结果，`ModelOutput` 需要能够承载这些结果。
 
-#### 10.7.2 扩展方案
+#### 10.8.2 扩展方案
 
 在 `ModelOutput` 中新增 GE 图输出字段：
 
@@ -1376,7 +1684,7 @@ struct ModelOutput {
 };
 ```
 
-#### 10.7.3 EpModel::forward() 输出处理
+#### 10.8.3 EpModel::forward() 输出处理
 
 ```cpp
 ModelOutput EpModel::forward(const torch::Tensor& tokens,
@@ -1407,23 +1715,47 @@ ModelOutput EpModel::forward(const torch::Tensor& tokens,
 }
 ```
 
-### 10.8 与现有方案的对比总结
+### 10.9 与现有方案的对比总结
 
-#### 10.8.1 Pipeline 职责对比
+#### 10.9.1 四层 Pipeline 职责对比
+
+**Master 层（请求构造）**：
+
+| 职责 | LlmRec | OneRecPrefill | OneRecXAttention | **GeGraph** |
+|------|--------|--------------|------------------|-------------|
+| 输入方式 | prompt + tokenizer | prompt + input_tensors | prompt + input_tensors | **prompt + tokenizer** |
+| build_stop_checker | true | false | true | **false** |
+| MMData 处理 | 无 | sparse_embedding 等 | sparse_embedding 等 | **无** |
+| 停止条件保留 | 仅 StoppingChecker | 不保留 | 仅 StoppingChecker | **RequestState 保留原始数据** |
+| 采样配置保留 | 仅 SamplingParam | 仅 SamplingParam | 仅 SamplingParam | **RequestState 保留标量** |
+
+**Engine 层（推理编排）**：
 
 | 职责 | LlmRec | OneRecPrefill | OneRecXAttention | MultiRound | **GeGraph** |
 |------|--------|--------------|------------------|------------|-------------|
 | Worker 初始化 | DistManager 远程 | 本地 PG + Worker | 本地 PG + Worker | 本地 PG + Worker | **本地 PG + Worker** |
 | 输入准备 | DP 拆分 + prepare | prepare_inputs | prepare_inputs | prepare_inputs | **prepare_inputs** |
 | forward 次数 | 动态 N 次 | 1+N 次 | N 轮 | N 轮 | **1 次** |
-| Sampling | Engine 层 | Worker 层 | Worker 层 | Worker 层 | **图内** |
-| Beam Search | Engine 层 | 无 | Worker 层 | Worker 层 | **图内** |
-| 多轮 decode | Engine 层循环 | Engine 层循环 | Worker 内循环 | Worker 内循环 | **图内** |
 | 输出处理 | process_sample/beam | process_sample | process_beam_group | process_beam group | **process_beam_sequence_group** |
+
+**Worker 层（设备计算）**：
+
+| 职责 | LlmRec | OneRecPrefill | OneRecXAttention | MultiRound | **GeGraph** |
+|------|--------|--------------|------------------|------------|-------------|
+| Sampling | Worker 层 | Worker 层 | Worker 层 | Worker 层 | **图内** |
+| Beam Search | Worker 层 | 无 | Worker 层 | Worker 层 | **图内** |
+| 多轮 decode | 无 | Engine 层循环 | Worker 内循环 | Worker 内循环 | **图内** |
 | Sampler 组件 | 需要 | 需要 | 需要 | 需要 | **不需要** |
 | BeamSearcher 组件 | 需要 | 不需要 | 不需要 | 不需要 | **不需要** |
 
-#### 10.8.2 代码复杂度对比
+**Scheduler 层（调度批处理）**：
+
+| 职责 | LlmRec | OneRec | OneRecXAttention | MultiRound | **GeGraph** |
+|------|--------|--------|------------------|------------|-------------|
+| requires_kv_cache | true | false | true | false | **true** |
+| Sequence 生命周期 | 逐步循环 | 逐步循环 | 一次性完成 | 一次性完成 | **一次性完成** |
+
+#### 10.9.2 代码复杂度对比
 
 | 指标 | RecMultiRound WorkPipeline | **GeGraph WorkPipeline** |
 |------|---------------------------|--------------------------|
@@ -1432,10 +1764,12 @@ ModelOutput EpModel::forward(const torch::Tensor& tokens,
 | 依赖组件 | Executor, RecSampler, KVCache manager | **Executor** |
 | 需要理解的领域知识 | 多轮 decode、beam search、sampling、KV cache 轮次管理 | **Batch → Tensor 转换** |
 
-### 10.9 文件结构
+### 10.10 文件结构
 
 ```
 xllm/core/distributed_runtime/
+├── rec_master.h                    # RecMasterPipeline 基类（已有）
+├── rec_master.cpp                  # 新增 GeGraphMasterPipeline 实现
 ├── rec_engine.h                    # RecEnginePipeline 基类（已有）
 ├── rec_engine.cpp                  # 新增 GeGraphEnginePipeline 实现
 └── ge_graph_engine_pipeline.h      # GeGraphEnginePipeline 类定义
@@ -1448,17 +1782,24 @@ xllm/core/runtime/
 ├── ge_graph_executor_impl.h        # GeGraphExecutorImpl（已有，扩展 GetGraphInputSchema）
 └── ge_graph_executor_impl.cpp      # GeGraphExecutorImpl 实现（已有）
 
+xllm/core/scheduler/
+├── fixed_steps_scheduler.h         # SchedulerPipeline 基类（已有）
+└── fixed_steps_scheduler.cpp       # 新增 GeGraphSchedulerPipeline 实现
+
 xllm/core/framework/model/
 ├── ep_model.h                      # EpModel（已有，扩展 GetGraphInputSchema/PrepareCustomInputs）
 ├── ep_model.cpp                    # EpModel 实现（已有）
 ├── graph_input_schema.h            # GraphInputSchema/GraphInputSpec/GraphInputSource 定义
 └── graph_input_builder.h           # GeGraphInputBuilder 通用填充器
 
+xllm/core/framework/request/
+└── request_state.h                 # RequestState（扩展 GE 图原始配置字段）
+
 xllm/core/util/
 └── rec_model_utils.h               # RecPipelineType 枚举（扩展 kGeGraphPipeline）
 ```
 
-### 10.10 实现计划
+### 10.11 实现计划
 
 #### Phase 1：Schema 基础设施
 1. 定义 `GraphInputSource` 枚举、`GraphInputSpec`、`GraphInputSchema` 类型
@@ -1467,7 +1808,17 @@ xllm/core/util/
 4. 实现 `GeGraphInputBuilder::BuildInputTensorMap()` 通用填充器
 5. `EpModel` 基类新增 `PrepareCustomInputs()` 虚方法（默认空实现）
 
-#### Phase 2：基础 Pipeline 实现
+#### Phase 2：RequestState 扩展 + Master/Scheduler Pipeline
+1. `RequestState` 新增 GE 图原始配置字段（`max_tokens`、`eos_token_id`、`stop_token_ids`、采样标量）
+2. `build_request_common()` 修改：保留原始配置数据到 `RequestState`
+3. 实现 `GeGraphMasterPipeline`
+   - `generate_request()`：tokenize + `build_stop_checker=false`
+4. 实现 `GeGraphSchedulerPipeline`
+   - `create_batches()`：Batch 构造
+   - `requires_kv_cache()`：返回 `true`
+5. 工厂方法扩展：`RecMaster::create_pipeline()`、`FixedStepsScheduler::create_pipeline()`
+
+#### Phase 3：基础 Pipeline 实现
 1. 新增 `RecPipelineType::kGeGraphPipeline` 枚举值
 2. 实现 `GeGraphWorkerPipeline`
    - `prepare_inputs()`：复用基类
@@ -1478,23 +1829,24 @@ xllm/core/util/
    - `step()`：prepare → get_model_output → process_beam_sequence_group → finish
 4. `GeGraphExecutorImpl` 扩展 `GetGraphInputSchema()` 和 `model()` 方法
 
-#### Phase 3：ModelOutput 扩展
+#### Phase 4：ModelOutput 扩展
 1. `ModelOutput` 新增 `beam_sequence_group` 和 `beam_search_output` 字段
 2. `EpModel::forward()` 根据图输出节点名称解析结果
 
-#### Phase 4：模型子类扩展（按需）
+#### Phase 5：模型子类扩展（按需）
 1. VLM 模型：`VlmEpModel::PrepareCustomInputs()` 补充多模态输入
 2. Rec 模型：`RecEpModel::PrepareCustomInputs()` 补充 encoder 输入
 
-#### Phase 5：集成测试
-1. 端到端推理测试（Batch → GE 图 → beam_sequence_group → Batch）
+#### Phase 6：集成测试
+1. 端到端推理测试（Request → Batch → GE 图 → beam_sequence_group → Batch → Response）
 2. 与 RecMultiRoundEnginePipeline 的输出一致性对比
 3. 多卡场景测试
 4. Schema 自动推导正确性测试（覆盖 LLM / VLM / Rec 三种模型类型）
+5. Sequence 生命周期验证（确认不走逐步 append_token 循环）
 
-### 10.11 模型输入抽象设计（Schema 驱动）
+### 10.12 模型输入抽象设计（Schema 驱动）
 
-#### 10.11.1 问题
+#### 10.12.1 问题
 
 不同模型的 GE 图输入节点差异很大：
 
@@ -1513,7 +1865,7 @@ Rec:  tokens, positions, encoder_tokens, encoder_positions, ...
 
 如果在 Pipeline 中硬编码每个模型的输入名字映射，每新增一种模型都要改 Pipeline，违反开闭原则。
 
-#### 10.11.2 方案选型
+#### 10.12.2 方案选型
 
 | 方案 | 思路 | 优点 | 缺点 |
 |------|------|------|------|
@@ -1523,7 +1875,7 @@ Rec:  tokens, positions, encoder_tokens, encoder_positions, ...
 
 **选择方案 C**。
 
-#### 10.11.3 核心设计
+#### 10.12.3 核心设计
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -1548,7 +1900,7 @@ Rec:  tokens, positions, encoder_tokens, encoder_positions, ...
 └──────────────────────────────────────────────────────┘
 ```
 
-#### 10.11.4 GraphInputSchema 数据结构
+#### 10.12.4 GraphInputSchema 数据结构
 
 ```cpp
 enum class GraphInputSource : uint8_t {
@@ -1573,7 +1925,7 @@ struct GraphInputSpec {
 using GraphInputSchema = std::vector<GraphInputSpec>;
 ```
 
-#### 10.11.5 Schema 自动推导
+#### 10.12.5 Schema 自动推导
 
 EpModel 在 `load_model()` 后从 `input_names_` 自动推导 Schema，无需每个模型手动配置：
 
@@ -1632,7 +1984,7 @@ std::optional<KVCacheMatch> ParseKVCacheName(const std::string& name) {
 }
 ```
 
-#### 10.11.6 GeGraphInputBuilder
+#### 10.12.6 GeGraphInputBuilder
 
 通用 Builder，按 Schema 从标准运行时数据中取数据填充 `input_tensor_map`：
 
@@ -1689,7 +2041,7 @@ public:
 };
 ```
 
-#### 10.11.7 Model 子类 Custom 输入扩展
+#### 10.12.7 Model 子类 Custom 输入扩展
 
 对于 Schema 无法自动推导的模型特有输入，通过 Model 子类 override 处理：
 
@@ -1719,7 +2071,7 @@ public:
 };
 ```
 
-#### 10.11.8 GeGraphExecutorImpl 暴露 Schema
+#### 10.12.8 GeGraphExecutorImpl 暴露 Schema
 
 `GeGraphExecutorImpl` 需要暴露 Schema 和 Model 指针供 Pipeline 使用：
 
@@ -1749,7 +2101,7 @@ GeGraphExecutorImpl::GeGraphExecutorImpl(CausalLM* model, ...) {
 }
 ```
 
-#### 10.11.9 完整调用流程
+#### 10.12.9 完整调用流程
 
 ```
 RecWorkerImpl::prepare_inputs(batch)
@@ -1767,7 +2119,7 @@ GeGraphExecutorImpl::run()
        └─ BuildGraphInputs(input_names_, input_tensor_map)  ← 按名字查找
 ```
 
-#### 10.11.10 不同模型类型的 Schema 示例
+#### 10.12.10 不同模型类型的 Schema 示例
 
 **LLM 模型**（如 Qwen2）：
 ```
@@ -1818,7 +2170,7 @@ input_names_ = ["tokens", "positions", "encoder_tokens", "encoder_positions",
 kCustom 数量: 2 → RecEpModel override PrepareCustomInputs()
 ```
 
-#### 10.11.11 方案对比总结
+#### 10.12.11 方案对比总结
 
 | 维度 | A: Pipeline 硬编码 | B: Model 填充 | **C: Schema 驱动** |
 |------|-------------------|--------------|-------------------|
@@ -1829,9 +2181,9 @@ kCustom 数量: 2 → RecEpModel override PrepareCustomInputs()
 | 扩展性 | 差 | 好 | **好（kCustom + override）** |
 | 代码量 | Pipeline 膨胀 | Model 膨胀 | **Builder 固定，Schema 自动生成** |
 
-### 10.12 待确认事项
+### 10.13 待确认事项
 
-#### 10.12.1 GE 图输出格式（高优先级）
+#### 10.13.1 GE 图输出格式（高优先级）
 
 **问题**：epair 图的输出 Tensor 格式是什么？
 
@@ -1844,7 +2196,7 @@ kCustom 数量: 2 → RecEpModel override PrepareCustomInputs()
 - 决定 `GeGraphWorkerPipeline::step()` 的输出构造逻辑
 - 决定 `ModelOutput` 的扩展方式
 
-#### 10.12.2 输出 D2H 策略
+#### 10.13.2 输出 D2H 策略
 
 **问题**：GE 图输出 Tensor 在 device 上，如何高效搬到 host？
 
@@ -1852,7 +2204,7 @@ kCustom 数量: 2 → RecEpModel override PrepareCustomInputs()
 - 使用异步 D2H 拷贝 + `Device::synchronize_default_stream()`
 - 参考 `OneRecXAttentionEnginePipeline::get_model_output()` 的 D2H 逻辑
 
-#### 10.12.3 非 beam search 场景
+#### 10.13.3 非 beam search 场景
 
 **问题**：如果某些请求不使用 beam search（纯 sampling），GE 图是否支持？
 
