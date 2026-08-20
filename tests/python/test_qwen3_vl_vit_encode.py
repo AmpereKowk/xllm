@@ -35,20 +35,9 @@ import time
 import pytest
 import torch
 
-# conftest.py installs a stub for xllm.python, we need to restore the real module
-def _restore_real_xllm_python():
-    """Restore real xllm.python module (undo conftest.py stub)."""
-    # Remove stub modules
-    for key in list(sys.modules.keys()):
-        if key.startswith("xllm.python"):
-            del sys.modules[key]
-    
-    # Now import the real xllm.python
-    import xllm.python
-
-_restore_real_xllm_python()
-
-# Register dummy ops before importing xllm modules
+# Step 1: Register dummy ops BEFORE importing xllm.python.
+# xllm/python/__init__.py imports kernels_npu at module level, which triggers
+# _custom_op.py's register_fake() calls. Those require the op schemas to exist.
 def _register_dummy_ops():
     """Register dummy xllm_ops so kernels_npu can import without C++ lib."""
     _dummy = lambda *a, **kw: None
@@ -85,9 +74,20 @@ def _register_dummy_ops():
 
 _register_dummy_ops()
 
-from xllm.python import initialize_runtime
-initialize_runtime()
+# Step 2: Restore real xllm.python (undo conftest.py stub).
+# Must happen AFTER dummy ops are registered, because xllm/python/__init__.py
+# imports kernels_npu at module level, which triggers _custom_op.py's
+# register_fake() calls that require the op schemas from Step 1.
+def _restore_real_xllm_python():
+    """Restore real xllm.python module (undo conftest.py stub)."""
+    for key in list(sys.modules.keys()):
+        if key.startswith("xllm.python"):
+            del sys.modules[key]
+    import xllm.python
 
+_restore_real_xllm_python()
+
+# Step 3: Import model classes (xllm.python is now fully initialized).
 from xllm.python.models.qwen3_vl import (
     Qwen3VLVisionConfig,
     Qwen3VLVisionTransformer,
@@ -295,7 +295,7 @@ import torch
 import sys
 sys.path.insert(0, "/mnt/workspace/gitCode/guopeian/xllm-ai/xllm")
 
-# Register dummy ops
+# Register dummy ops BEFORE importing xllm.python
 _dummy = lambda *a, **kw: None
 _ops = [
     ("rms_norm", "(Tensor input, Tensor weight, float eps) -> Tensor"),
@@ -328,8 +328,7 @@ for name, schema in _ops:
     except RuntimeError:
         pass
 
-from xllm.python import initialize_runtime
-initialize_runtime()
+import xllm.python
 
 from xllm.python.models.qwen3_vl import Qwen3VLVisionConfig, Qwen3VLVisionTransformer
 from xllm.python.model_executor.vit_executor import ViTExecutor
