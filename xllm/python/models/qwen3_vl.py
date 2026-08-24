@@ -483,6 +483,7 @@ class Qwen3VLVisionTransformer(nn.Module):
 
         return torch.stack([hpos_ids, wpos_ids], dim=-1)
 
+    @torch.compiler.disable
     def _compute_rot_pos_emb(self, grid_thw_list: list[list[int]]) -> tuple[torch.Tensor, torch.Tensor]:
         max_grid_size = max(max(h, w) for _, h, w in grid_thw_list)
         pos_ids = []
@@ -495,6 +496,7 @@ class Qwen3VLVisionTransformer(nn.Module):
         cos, sin = self.rotary_pos_emb(pos_ids)
         return cos, sin
 
+    @torch.compiler.disable
     def _fast_pos_embed_interpolate(self, grid_thw_list: list[list[int]]) -> torch.Tensor:
         """Bilinearly interpolate the learned pos_embed to each image's grid."""
         num_grid = self.num_grid_per_side
